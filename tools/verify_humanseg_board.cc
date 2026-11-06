@@ -3,12 +3,12 @@
 // 目的：确认 model/humanseg/humanseg_v1_lite_398x224.rknn（Softmax 前截断版）
 // 在真实 NPU 上输出正常 —— 即 NOTES §6 的"概率塌缩"在板端确实已消失。
 //
-// 编译（demo-rknn-object-detect 根目录）：
+// 编译（本仓库根目录）：
 //   export GCC_COMPILER=<SDK>/prebuilts/gcc/linux-x86/aarch64/\
 //gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu
-//   $GCC_COMPILER-g++ -O2 -std=c++11 scripts/verify_humanseg_board.cc \
-//       -I3rdparty/librknn_api/include -o /tmp/verify_humanseg_board \
-//       -L3rdparty/librknn_api/aarch64 -lrknnrt -lpthread
+//   $GCC_COMPILER-g++ -O2 -std=c++11 tools/verify_humanseg_board.cc \
+//       -I3rdparty/rknn_api/include -o /tmp/verify_humanseg_board \
+//       -L3rdparty/rknn_api/lib -lrknnrt -lpthread
 //
 // 用法（板端）：
 //   ./verify_humanseg_board <model.rknn> <img1.rgb> [img2.rgb ...]

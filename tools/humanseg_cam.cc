@@ -9,17 +9,17 @@
 // 模型输出：hotseg rknn 是 **Softmax 之前截断**的 2 通道 logits，
 // 布局为 (1, W, H, 2)（ONNX 尾部 Transpose perm=[0,3,2,1] 把 H/W 也换了）。
 //
-// 编译（demo-rknn-object-detect 根目录）：
+// 编译（本仓库根目录）：
 //   export GCC_COMPILER=<SDK>/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu
-//   SYS=<SDK>/buildroot/output/rockchip_rk3576/staging
-//   export PKG_CONFIG_SYSROOT_DIR=$SYS PKG_CONFIG_LIBDIR=$SYS/usr/lib/pkgconfig:$SYS/usr/share/pkgconfig
-//   $GCC_COMPILER-g++ -O2 -std=c++11 scripts/humanseg_cam.cc \
-//     $(pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0) \
-//     -I3rdparty/librknn_api/include -o /tmp/humanseg_cam \
-//     -L3rdparty/librknn_api/aarch64 -lrknnrt \
-//     -L3rdparty/gst-board -lgstreamer-1.0 -lgstapp-1.0 -lgstvideo-1.0 \
+//   $GCC_COMPILER-g++ -O2 -std=c++11 tools/humanseg_cam.cc \
+//     -I3rdparty/gst/include/gstreamer-1.0 \
+//     -I3rdparty/gst/include/glib-2.0 \
+//     -I3rdparty/gst/include/glib-2.0-internal \
+//     -I3rdparty/rknn_api/include -o /tmp/humanseg_cam \
+//     -L3rdparty/rknn_api/lib -lrknnrt \
+//     -L3rdparty/gst/lib -lgstreamer-1.0 -lgstapp-1.0 -lgstvideo-1.0 \
 //     -lgobject-2.0 -lglib-2.0 \
-//     -Wl,-rpath-link,3rdparty/gst-board -Wl,--allow-shlib-undefined -lpthread
+//     -Wl,-rpath-link,3rdparty/gst/lib -Wl,--allow-shlib-undefined -lpthread
 //
 // 运行（板端，桌面用户身份）：
 //   sudo -u qq env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \

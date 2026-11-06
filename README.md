@@ -192,24 +192,6 @@ model/legacy/            早期试过的 humanseg_v1 系列模型
 3rdparty/                GStreamer + RKNN 头文件与库
 ```
 
-## 从 demo-rknn-object-detect 迁移
-
-本项目早期代码写在 `demo-rknn-object-detect` 里（借用了它的 3rdparty 和
-构建脚本）。现在已全部迁到本仓库，**目标检测仓库里不再保留任何与本项目
-相关的内容**：
-
-| 原位置 | 现位置 |
-|---|---|
-| `scripts/humanseg_y8seg.cc` | `src/humanseg_y8seg.cc` |
-| `scripts/*.py` | `scripts/` |
-| `scripts/probe_*.py`、`verify_*` | `tools/`（历史存档） |
-| `docs/*.md` | `docs/` |
-| `model/humanseg/*.rknn` | `model/y8s_rkv.rknn`、`model/legacy/` |
-
-`src/humanseg_y8seg.cc` 与迁移前代码逻辑完全一致，只改了文件头的编译说明
-（指向本仓库的 `./build.sh`）。构建产物 `build/hy8` 经 md5 核对与板端
-运行中的二进制一致。
-
 ## License
 
 见 [LICENSE](LICENSE)。

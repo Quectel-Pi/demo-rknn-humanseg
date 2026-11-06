@@ -2,7 +2,7 @@
 
 > 状态：**模型已定稿并验证通过**（RKNN logits 版 IoU 与 ONNX 一致，可进入 C++ demo 阶段）
 > 日期：2026-11-03
-> 参考：`demo-rknn-object-detect`（USB 摄像头链路）、[PaddleSeg](https://github.com/PaddlePaddle/PaddleSeg)、[rknn_model_zoo/examples/ppseg](https://github.com/airockchip/rknn_model_zoo/tree/main/examples/ppseg)
+> 参考：[PaddleSeg](https://github.com/PaddlePaddle/PaddleSeg)、[rknn_model_zoo/examples/ppseg](https://github.com/airockchip/rknn_model_zoo/tree/main/examples/ppseg)
 
 ---
 
@@ -14,27 +14,26 @@ USB 摄像头实时画面 → NPU 人像分割 → 抠像 → 替换虚拟背景
 
 ---
 
-## 2. 可复用的既有代码（USB 摄像头链路）
+## 2. 采集与显示链路
 
-来源：`demo-rknn-object-detect` 仓库的 `src/main_video.cc`
-（历史开发路径 `/home/q/share/zenith_code/demo/demo-rknn-object-detect/`，
- 人像分割代码现已迁移到本仓库，该文件仍留在原仓库供参考）
+本 demo 的完整链路（实现在 `src/humanseg_y8seg.cc`）：
 
-| 位置 | 功能 |
-|------|------|
-| `src/main_video.cc:780-1017` | `process_v4l2_camera()` 主循环 |
-| `src/v4l2_capture.cpp/.h` | V4L2 MMAP 采集，MJPG 1280×720@30fps，自动探测 MPLANE |
-| `decode_mjpg_to_rgb()` `main_video.cc:763` | stb_image 单头文件 MJPG → RGB888（CPU 软解，30-40ms/帧，是当前 FPS 瓶颈） |
-| `main_video.cc:841-850` | letterbox 到模型输入尺寸，pad=114 灰 |
-| `main_video.cc:112-181` | `gst_display_bgr_init/push` — appsrc(BGR) → videoscale → waylandsink |
-| `main_video.cc:597` | `mpp_decoder_frame_callback` NV12 显示路径（本 demo 不用） |
+| 阶段 | 实现 | 说明 |
+|------|------|------|
+| 采集 | `v4l2src io-mode=4` + `mppjpegdec` + `appsink` | MJPG 1280×720@30fps，MPP 硬件 JPEG 解码，直接出 BGR，无 CPU 软解瓶颈 |
+| 预处理 | letterbox 到 640×640 | pad = 114 灰 |
+| 推理 | `rknn_run` | 约 16 ms/帧，三线程流水线中独立运行，可跳帧 |
+| 掩码后处理 | 双线性上采样 + 羽化 + 时序 EMA | 640 域 4 px 一级的台阶在放大到 1280 后会是 8 px，必须双线性 |
+| 合成 | alpha 混合虚拟背景 | 4 档背景样式，运行时切换 |
+| 显示 | 共享内存 → GTK4 全屏 | 显示端零丢帧；不用 `waylandsink`，避免视频层盖住设置面板 |
 
-**人像分割替换点**：把 `stb_image` 解码后的 RGB 帧送分割网络，得到 mask 后与原图合成，再喂给 `gst_display_bgr_push`。检测框/tracker/统计面板代码全部不需要。
+三线程以有损 ring（drop-oldest）解耦：实时抠像只关心最新帧，积压的旧帧没有价值，
+丢弃优于让延迟无界增长。单线程串行实测只有 9.3 fps，拆分后稳定 28 fps。
 
-原有显示参数（可直接沿用）：
+采集与显示参数：
 
 ```bash
-./demo model.rknn --v4l2 /dev/video73 --display --disp-size 1280x800
+./hy8 y8s_rkv.rknn --device /dev/video73 --cam 1280x720 --disp 1280x800
 ```
 
 ---
@@ -318,8 +317,7 @@ Paddle 原生推理跑同样三种预处理给出**完全相同**的数字（0.5
 
 - [x] 修 GT 二值化（`> 0`），确定 ONNX 正确的输入预处理 → **ImageNet 归一化**（§7）
 - [x] 定位 RKNN 概率塌缩真因 → **Softmax 算子编译错误**，截断输出绕开（§6）
-- [ ] 模型定稿后，在 `demo-rknn-object-detect` 基础上新建
-      `demo-rknn-portrait-bg`，复用 §2 的 V4L2 + gst 显示链路
+- [x] 模型定稿后新建独立仓库 `demo-rknn-humanseg`，复用人像分割链路
 - [ ] 抠像后处理：mask 边缘羽化（guided filter / 形态学 / 双线性上采样），
       否则人像边缘锯齿明显
 - [ ] **⚠️ 靠背残留（背景泄漏）**：y8s 在近距离构图下输出
