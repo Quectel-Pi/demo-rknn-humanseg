@@ -20,10 +20,21 @@ RK3576 上的人像分割 + 虚拟背景实时 demo。摄像头实时抠人，�
 
 ## 快速开始
 
-### 1. 编译
+### 0. 最省事：不编译，直接用预编译版本
 
-只需要一个 aarch64 交叉编译器，**头文件和库都已随仓库提供**，不用装 SDK、
-不用配 pkg-config。
+仓库自带 `install/hy8`（aarch64 预编译，已与板端验证版本 MD5 一致），
+配合 `3rdparty/` 里的 `librknnrt.so`，**既不需要 RK3576 SDK，也不需要交叉编译器**：
+
+```bash
+./deploy.sh
+```
+
+它会推送二进制、模型、`librknnrt.so` 和全部脚本，然后自动启动。
+
+### 1. 从源码编译（想改代码时）
+
+只需要一个 aarch64 交叉编译器，**头文件和库都已随仓库提供**（`3rdparty/`，25MB），
+不用装 SDK、不用配 pkg-config、不用设 `PKG_CONFIG_PATH`。
 
 ```bash
 ./build.sh
@@ -38,12 +49,15 @@ sudo apt install g++-aarch64-linux-gnu
 CXX=aarch64-linux-gnu-g++ ./build.sh
 ```
 
-或指定 RK3576 SDK 里的：
+或指定 RK3576 SDK 里的（可选，仓库不依赖 SDK）：
 
 ```bash
 CXX=$SDK/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-g++ \
 ./build.sh
 ```
+
+> 已实测：在清空 `PKG_CONFIG_PATH` / `PKG_CONFIG_SYSROOT_DIR`、只用交叉编译器的环境里，
+> `./build.sh` 能编译出与板端 `fb7268ebd5a4fb80957f0ad5669dfaa4` **完全相同**的 `hy8`。
 
 ### 2. 部署 + 启动
 
@@ -125,7 +139,8 @@ display   ~17.4ms
 
 ```
 build.sh              交叉编译（自带头文件/库，只要工具链）
-deploy.sh             adb 部署 + 启动
+deploy.sh             adb 部署 + 启动（优先用 install/hy8，不需要先编译）
+install/hy8           预编译 aarch64 二进制，入库，push 即跑
 src/humanseg_y8seg.cc 后端全部逻辑（取流/推理/解码/后处理/合成/共享内存）
 scripts/
   run_humanseg.sh     板端一键启动（自动探测桌面用户）

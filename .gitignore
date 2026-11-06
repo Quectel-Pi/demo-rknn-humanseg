@@ -1,7 +1,12 @@
 # 构建产物
+# build/ 是本机编译输出，不入库；可直接运行的预编译版本在 install/
 build/
 *.o
 *.a
+
+# install/ 是**要入库**的预编译产物，供没有 SDK / 没有交叉工具链的用户
+# 直接 push 到板子运行。不要忽略它。
+!install/
 
 # IDE
 .vscode/
