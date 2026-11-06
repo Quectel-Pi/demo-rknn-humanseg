@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Portrait Segmentation
+Name[zh_CN]=人像分割
+Comment=Toggle portrait segmentation and virtual background
+Comment[zh_CN]=开关人像分割与虚拟背景
+Exec=/usr/local/bin/humanseg-settings.sh
+Icon=camera-web
+Terminal=false
+Categories=Settings;HardwareSettings;
+StartupNotify=false

@@ -1,0 +1,8 @@
+{
+  "name": "HumanSeg Quick Settings",
+  "description": "Portrait segmentation toggle and virtual background picker in the Quick Settings panel.",
+  "uuid": "humanseg@quectel.local",
+  "settings-schema": null,
+  "shell-version": ["45", "46", "47", "48"],
+  "version": 1
+}
