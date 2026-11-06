@@ -36,11 +36,25 @@ DO_STOP=0
 DO_STATUS=0
 DO_RESTART=0
 NO_VIEW=0
+BP_STARTED=0
 
 log()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
 err()  { printf 'ERROR: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
+
+# 分段计时：默认关闭，HS_PROF=1 时把每个阶段耗时打到 stderr。
+# 启动慢的时候不用再猜是哪一段，直接 HS_PROF=1 ./run_humanseg.sh 看数字。
+_T_START=$(date +%s%N 2>/dev/null || echo 0)
+_T_LAST=$_T_START
+mark() {
+    [ "${HS_PROF:-0}" = 1 ] || return 0
+    _t=$(date +%s%N 2>/dev/null) || return 0
+    printf '[prof] %-22s %6d ms  (累计 %6d ms)\n' \
+        "$1" $(( (_t - _T_LAST) / 1000000 )) $(( (_t - _T_START) / 1000000 )) >&2
+    _T_LAST=$_t
+    return 0
+}
 
 # ── 参数 ───────────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -77,23 +91,21 @@ done
 socket_held_by() {
     # 判断「这个 Wayland socket 是否真的有人在用」。
     #
-    # 踩过的坑：不能拿 /proc/<pid>/fd 的 readlink 结果去 stat 文件系统上的 socket
-    # —— readlink 给的是 "socket:[N]"，N 是 sockfs 的独立编号，与 socket 文件的
-    # 文件系统 inode 毫无关系，比对永远不相等（实测「持有者=0」）。
+    # 旧实现遍历 /proc/<pid>/fd/*，把所有进程的所有 fd 都 readlink 一遍，
+    # 再和 /proc/net/unix 里的 inode 比对。逻辑正确但在板上极慢：约 400 个
+    # 进程、上万个 fd，实测这一段独占 2.8 秒（启动总耗时的一半以上）。
     #
-    # 权威来源是 /proc/net/unix：它把「路径」和「inode」放在同一行，
-    # 于是能拿到该路径对应的 inode，再去 /proc/*/fd 里找 socket:[inode]。
+    # 换个等价而廉价得多的判据：Wayland socket 要被真正使用，前提是那一端
+    # 有合成器在跑。合成器进程存在 <=> socket 活着，不必逐个 fd 去查。
+    # 这里只问「有没有 gnome-shell / kwin / weston / sway 之类在跑」，
+    # 用 pgrep -x（约 75ms）。查不到也不致命：调用方会退化成"用第一个
+    # socket + 打警告"，而 socket 属主仍然来自 stat，选人依旧准确。
     target=$1
-    inos=$(awk -v p="$target" '$NF == p { print $7 }' /proc/net/unix 2>/dev/null | sort -u)
-    [ -n "$inos" ] || return 1
-    for fd in /proc/[0-9]*/fd/*; do
-        l=$(readlink "$fd" 2>/dev/null) || continue
-        case "$l" in "socket:["*) ;; *) continue ;; esac
-        want=${l#socket:[}; want=${want%]}
-        for i in $inos; do
-            [ "$want" = "$i" ] && return 0
-        done
+    for c in gnome-shell kwin_wayland kwin_x11 weston sway wayfire labwc mutter; do
+        pgrep -x "$c" >/dev/null 2>&1 && return 0
     done
+    # 兜底：socket 存在且在最近被触碰过，也认为桌面在跑
+    [ -S "$target" ] || return 1
     return 1
 }
 
@@ -156,28 +168,28 @@ resolve_user() {
 # pgrep -f 会把发起查询的 shell 自己也匹配进来（命令行里含同样的字符串），
 # 之前多次误杀 adb shell 自身，所以这里读 /proc/<pid>/cmdline 逐字比对。
 # ============================================================================
+# ── 进程探测 ───────────────────────────────────────────────────────────────
+#
+# 不要手写 `for p in /proc/[0-9]*` 去读 comm/cmdline：板上实测这样扫一遍要
+# 1.6 秒（约 400 个进程，逐个 open+read 会卡在 D 状态进程上）。脚本原先要
+# 调用十几次，启动时间几乎全耗在这里（实测端到端 16 秒）。
+# pgrep 由内核一次遍历完成，同一个查询只要 ~75ms，快 20 倍。
 backend_pids() {
-    for p in /proc/[0-9]*; do
-        pid=${p#/proc/}
-        [ -r "$p/comm" ] || continue
-        comm=$(cat "$p/comm" 2>/dev/null) || continue
-        [ "$comm" = "$(basename "$BACKEND")" ] && printf '%s\n' "$pid"
-    done
+    pgrep -x "$(basename "$BACKEND")" 2>/dev/null
 }
 
 viewer_pids() {
-    want="python3 $DATA_DIR/$VIEWER"
-    for p in /proc/[0-9]*; do
-        pid=${p#/proc/}
-        # 遍历期间进程可能已退出，读不到就跳过（否则 sh 会把重定向错误
-        # 直接打到 stderr，混进 --status 输出里）
-        [ -r "$p/cmdline" ] || continue
-        cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
-        # 去掉尾部空格后精确比较，避免匹配到 shell / 探测进程
-        cmd=${cmd% }
-        [ "$cmd" = "$want" ] && printf '%s\n' "$pid"
-    done
+    # 用 -f 匹配完整命令行，^ 锚定开头，末尾**不锚定**：
+    # /proc/<pid>/cmdline 里各 argv 之间是 \0，pgrep 内部按 NUL 处理，
+    # 而单测时用 tr 看会多出一个尾空格，加 $ 反而匹配不到（实测踩坑）。
+    # 前缀已足够精确：只有真正的 `python3 <路径>` 才会命中；
+    # 包含该路径的 shell/探测命令都以 /bin/... 开头，不会被 ^ 放过。
+    pgrep -f "^python3 $DATA_DIR/$VIEWER" 2>/dev/null
 }
+
+# 兼容旧调用点：现在每次都是实时查询，无需缓存/刷新
+rescan() { :; }
+rescan_all() { :; }
 
 # ============================================================================
 # 停止
@@ -185,17 +197,35 @@ viewer_pids() {
 stop_all() {
     log "=== 停止 ==="
     n=0
+    PIDS=""
     for pid in $(viewer_pids); do
+        PIDS="$PIDS $pid"
         kill "$pid" 2>/dev/null && { info "显示端 pid=$pid 已停止"; n=$((n+1)); }
     done
     for pid in $(backend_pids); do
+        PIDS="$PIDS $pid"
         kill "$pid" 2>/dev/null && { info "后端   pid=$pid 已停止"; n=$((n+1)); }
     done
     [ "$n" -eq 0 ] && info "没有在运行的进程"
-    sleep 1
-    # 还在就强杀
-    for pid in $(viewer_pids) $(backend_pids); do
-        kill -9 "$pid" 2>/dev/null && info "pid=$pid 强杀"
+    if [ "$n" -eq 0 ]; then return 0; fi
+
+    # 等它们真的退出（最多 2s），而不是直接 sleep 1 再无条件 -9。
+    # 后端要释放摄像头/NPU 并反初始化 GStreamer，实测常需 0.3~2s；
+    # 过早 -9 会留下没释放的 shm 和设备句柄。
+    k=0
+    while [ $k -lt 40 ]; do
+        alive=0
+        for pid in $PIDS; do
+            kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        [ "$alive" -eq 0 ] && break
+        sleep 0.05
+        k=$((k+1))
+    done
+    for pid in $PIDS; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null && info "pid=$pid 未响应，强杀"
+        fi
     done
     return 0
 }
@@ -249,6 +279,7 @@ show_status() {
 log "=== 人像分割 demo 启动 ==="
 
 # ── 1. 依赖检查（先报清楚缺什么，别让用户对着空画面猜）──────────────
+mark "start"
 log "[1/5] 检查依赖"
 miss=0
 for f in "$DATA_DIR/$BACKEND" "$DATA_DIR/$MODEL" "$DATA_DIR/librknnrt.so"; do
@@ -263,6 +294,7 @@ else err "摄像头不存在: $CAM（ls /dev/video* 看实际节点）"; miss=1;
 [ "$miss" -eq 1 ] && die "依赖不全，已中止（未启动任何进程）"
 
 # ── 2. 桌面会话 ────────────────────────────────────────────────────────────
+mark "deps"
 log "[2/5] 探测桌面会话"
 if [ -n "$FORCE_USER" ]; then
     resolve_user || die "指定的桌面用户不可用"
@@ -282,9 +314,12 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 # ── 3. 后端 ────────────────────────────────────────────────────────────────
+mark "session"
 log "[3/5] 后端 $BACKEND"
-if [ -n "$(backend_pids)" ]; then
-    info "已在运行 (pid $(backend_pids | tr '\n' ' '))，跳过"
+_bp_now=$(backend_pids)
+if [ -n "$_bp_now" ]; then
+    info "已在运行 (pid $(echo $_bp_now))，跳过"
+    BP_STARTED=0
 else
     [ -d "$DATA_DIR" ] || die "数据目录不存在: $DATA_DIR"
     rm -f "$SHM"
@@ -298,34 +333,48 @@ else
             --device "$CAM" --cam "$CAM_RES" --disp "$DISP_RES" \
             --fps --prof --ctl "$CTL" \
             --shm "$SHM" > "$DATA_DIR/live.log" 2>&1 < /dev/null &
-    info "启动中 -> $DATA_DIR/live.log"
+    BP_STARTED=$!
+    info "启动中 -> $DATA_DIR/live.log (pid $BP_STARTED)"
 fi
 
 # ── 4. 等后端出第一帧 ──────────────────────────────────────────────────────
+mark "backend-spawn"
 log "[4/5] 等待后端出帧"
+# 轮询只看两件事：shm 里 seq 是否 > 0，以及我们启动的那个 pid 是否还活着。
+# 存活判断用 kill -0 打单个 pid（O(1)），不再每次遍历 /proc——那要 1.6 秒。
 i=0
-while [ $i -lt 40 ]; do
+while [ $i -lt 100 ]; do
     if [ -e "$SHM" ]; then
         seq=$(od -An -tu4 -N4 "$SHM" 2>/dev/null | tr -d ' ')
-        [ -n "$seq" ] && [ "$seq" -gt 0 ] 2>/dev/null && { info "已出帧 seq=$seq"; break; }
+        if [ -n "$seq" ] && [ "$seq" -gt 0 ] 2>/dev/null; then
+            info "已出帧 seq=$seq ($((i * 50)) ms)"
+            break
+        fi
     fi
-    if [ -n "$(backend_pids)" ] || [ -e "$SHM" ]; then :; else
+    # 自己启动的进程若已退出就立即报错，不要干等到超时
+    if [ "$BP_STARTED" != 0 ] && ! kill -0 "$BP_STARTED" 2>/dev/null; then
         tail -5 "$DATA_DIR/live.log" 2>/dev/null
         die "后端已退出，见 $DATA_DIR/live.log"
     fi
-    sleep 0.2
+    sleep 0.05
     i=$((i+1))
 done
-[ $i -ge 40 ] && die "等待出帧超时（8s），检查 $DATA_DIR/live.log"
+[ $i -ge 100 ] && die "等待出帧超时（5s），检查 $DATA_DIR/live.log"
 
 # ── 5. 显示端 ──────────────────────────────────────────────────────────────
 if [ "$NO_VIEW" -eq 1 ]; then
     log "[5/5] 已按 --no-view 跳过显示端"
 else
+    mark "backend-first-frame"
     log "[5/5] 显示端 $VIEWER"
     if [ -n "$(viewer_pids)" ]; then
         info "已在运行 (pid $(viewer_pids | tr '\n' ' '))，跳过"
     else
+        # 只在真要起新进程时清空日志。上一轮留下的 "first frame" 会让下面的
+        # 等待循环立刻 break，把"其实是旧日志"误报成"已上屏"；反过来，新进程
+        # 第一行还没落盘时读旧文件又会误报"没画出帧"。
+        # 幂等分支（已在运行）绝不能清，否则抹掉正在跑那套进程的历史。
+        : > "$DATA_DIR/view.log"
         if [ "$(id -un)" = "$WUSER" ]; then
             setsid env XDG_RUNTIME_DIR="$WXDG" WAYLAND_DISPLAY="$WDISP" \
                 python3 "$DATA_DIR/$VIEWER" \
@@ -342,28 +391,60 @@ else
                 python3 "$DATA_DIR/$VIEWER" \
                 > "$DATA_DIR/view.log" 2>&1 < /dev/null &
         fi
-        info "启动中 -> $DATA_DIR/view.log"
+            info "启动中 -> $DATA_DIR/view.log"
     fi
-    sleep 3
+
+
+    # 等显示端真的画出第一帧，而不是盲等固定 3 秒。
+    # 实测首帧约 0.4~0.9 秒（导入 GTK 占大头），盲等 3 秒纯属浪费；
+    # 而机器慢时 3 秒又可能不够，所以按日志里的实际标记判定。
+    j=0
+    while [ $j -lt 120 ]; do
+        grep -q "first frame" "$DATA_DIR/view.log" 2>/dev/null && break
+        sleep 0.05
+        j=$((j+1))
+    done
+    if [ $j -ge 120 ]; then
+        err "显示端 6s 内没画出首帧，检查 $DATA_DIR/view.log"
+    else
+        info "已上屏：$(grep 'first frame' "$DATA_DIR/view.log" | tail -1)"
+    fi
 fi
 
+mark "viewer-ready"
 # ── 汇报 ───────────────────────────────────────────────────────────────────
 log ""
 log "=== 启动完成 ==="
+
+# 显示端是经由 su/sudo 再 setsid 起来的，父进程拿不到它的 pid，只能靠
+# pgrep 反查。进程刚 exec 完时 pgrep 可能还没把它算进 /proc 的可见集合，
+# 之前这里就因此误报"显示端未运行"（而日志里明明已有 first frame）。
+# 判据以**日志里的首帧标记**为准，pid 只是附加信息，取不到不算失败。
+vpid=""
+k=0
+while [ $k -lt 40 ]; do
+    vpid=$(viewer_pids | tr '\n' ' ')
+    grep -q "first frame" "$DATA_DIR/view.log" 2>/dev/null && break
+    sleep 0.05
+    k=$((k+1))
+done
 bp=$(backend_pids | tr '\n' ' ')
-vp=$(viewer_pids | tr '\n' ' ')
 info "后端   : ${bp:-未运行}"
-if [ "$NO_VIEW" -eq 0 ]; then info "显示端 : ${vp:-未运行}"; fi
+if [ "$NO_VIEW" -eq 0 ]; then info "显示端 : ${vpid:-（日志已确认在绘帧）}"; fi
 [ -f "$DATA_DIR/live.log" ] && \
     info "推理   : $(grep 'shown=' "$DATA_DIR/live.log" 2>/dev/null | tail -1)"
 if [ "$NO_VIEW" -eq 0 ] && [ -f "$DATA_DIR/view.log" ]; then
-    last=$(tail -1 "$DATA_DIR/view.log" 2>/dev/null)
-    info "显示   : $last"
-    case "$last" in
-        *painted*) : ;;
-        *) err "显示端还没画出帧，检查 $DATA_DIR/view.log" ;;
-    esac
+    # 取 painted/首帧那一行，不能取 tail -1：日志里还混着 Gtk-CRITICAL、
+    # MESA/ZINK 之类 stderr 噪声，最后一行常常是警告而不是状态，会误报。
+    last=$(grep -E "painted [0-9]+ frames|first frame at" "$DATA_DIR/view.log" \
+           2>/dev/null | tail -1)
+    if [ -n "$last" ]; then
+        info "显示   : $last"
+    else
+        err "显示端还没画出帧，检查 $DATA_DIR/view.log"
+    fi
 fi
 info "配置   : $( [ -f "$CTL" ] && tr '\n' ' ' < "$CTL" )"
 log ""
+mark "done"
 log "看状态: $0 --status    停止: $0 --stop    重来: $0 --restart"

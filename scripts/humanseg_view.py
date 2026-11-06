@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""人像分割输出界面 —— 画面 + 右上角齿轮设置按钮（GTK4 全屏）。
+"""Human segmentation output window - frame plus a gear settings button in the
+top-right corner (GTK4 fullscreen).
 
-为什么是这个结构：
-  Wayland 下应用不能自己决定窗口位置，板上也没有 layer-shell，
-  所以**没法**把按钮浮在 waylandsink 的视频上面。唯一能让按钮
-  真正压在画面右上角的办法，就是让画面本身画在 GTK4 窗口里。
-  后端 C++ 通过 --shm 把每帧像素丢过来，本进程只负责上屏。
+Why this structure:
+  Under Wayland an application cannot position its own window, and the board has
+  no layer-shell, so there is **no way** to float a button above a waylandsink
+  video surface. The only way to get the button genuinely on top of the frame is
+  to draw the frame inside a GTK4 window itself. The C++ backend publishes each
+  frame's pixels through --shm and this process only puts them on screen.
 
-帧协议（与 humanseg_y8seg.cc 的 shm_publish 对应）：
-  offset 0   uint32 seq   递增序号（变了 = 有新帧）
+Frame protocol (mirrors shm_publish in humanseg_y8seg.cc):
+  offset 0   uint32 seq   increasing sequence number (changed = new frame)
   offset 4   uint32 w
   offset 8   uint32 h
   offset 12  uint32 pad
-  offset 16  BGR 像素 w*h*3
+  offset 16  BGR pixels w*h*3
 """
 import mmap
 import os
@@ -30,14 +32,19 @@ from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 SHM = "/dev/shm/humanseg.frames"
 CTL = "/data/hs_test/ctl.conf"
 HDR = 16
+
+# Timestamp of interpreter start, used to report first-frame latency. Measured
+# from process start so it includes import and GTK startup, not just our loop.
+_START_T = time.time()
 BG_NAMES = ["Teal (default)", "Dimmed camera", "Solid gray", "Green screen"]
 
-# 样式表。必须在这里定义、由 View.__init__ 安装，不能只在 main() 里装：
-# 任何其它入口（测试脚本、别的进程 import 本模块）如果绕过 main()，
-# 就会拿到一套**完全没样式**的控件 —— 齿轮和面板都是主题默认的白底，
-# 而文字又继承了浅色，结果就是白底白字看不清。
-# background-image: none 是必须的：Adwaita 的主题底色就是用
-# background-image 画的，只设 background-color 会被它盖住。
+# Stylesheet. It must be defined here and installed by View.__init__, not only
+# from main(): any other entry point (test scripts, another process importing
+# this module) that bypasses main() would get **completely unstyled** widgets -
+# the gear and panel fall back to the theme's white background while the text
+# inherits a light colour, which is white on white and unreadable.
+# background-image: none is mandatory: Adwaita paints its base colour with
+# background-image, so setting only background-color gets covered by it.
 _CSS = b"""
 .humanseg-gear {
     background-image: none;
@@ -83,6 +90,18 @@ _CSS = b"""
 .humanseg-panel button:hover {
     background-color: rgba(255, 255, 255, 0.24);
 }
+/* Background style radio row: highlight the active choice.
+   Plain Button + "selected" class, not a ToggleButton :checked state. */
+.humanseg-panel .humanseg-bgbtn {
+    font-size: 11px;
+    padding: 6px 4px;
+    background-color: rgba(255, 255, 255, 0.08);
+}
+.humanseg-panel .humanseg-bgbtn.selected {
+    background-color: rgba(120, 190, 255, 0.55);
+    color: #ffffff;
+    font-weight: bold;
+}
 /* DropDown search entry: without this it inherits the theme's dark text
    and disappears against our dark backdrop. */
 .humanseg-panel entry,
@@ -120,7 +139,7 @@ _css_installed = False
 
 
 def install_css():
-    """幂等地把 _CSS 挂到 display 上。"""
+    """Idempotently attach _CSS to the display."""
     global _css_installed
     if _css_installed:
         return
@@ -134,7 +153,7 @@ def install_css():
     _css_installed = True
 
 
-# ── 控制文件 ───────────────────────────────────────────────────────
+# ── Control file ────────────────────────────────────────────────
 def read_ctl():
     seg, bg = 1, 0
     try:
@@ -156,15 +175,19 @@ def read_ctl():
 
 
 def write_ctl(seg, bg):
-    """只改 seg/bg，**保留 ctl.conf 里的其它键**（thr/up/margin/orphan/dump）。
+    """Change only seg/bg, **preserving every other key** in ctl.conf
+    (thr/up/margin/orphan/dump).
 
-    旧实现只写 "seg=%d\\nbg=%d\\n" 两行，用户在面板上点一下开关，
-    现场调好的 thr=35、up=1 等参数就被整段抹掉，画面悄悄退回默认值
-    —— 表现为「点一下开关，轮廓又变差了」。这是本函数的唯一职责边界：
-    它没有资格丢弃自己不认识的键。
+    The old implementation wrote just the two lines "seg=%d\\nbg=%d\\n", so a
+    single click on a panel switch wiped the tuned thr=35 / up=1 values and the
+    picture silently fell back to defaults - which looked like "the outline got
+    worse again after I touched a switch". That is this function's only
+    responsibility boundary: it has no right to drop keys it does not
+    understand.
 
-    用唯一临时名：固定 .tmp 在多个写入方（界面 / 验证脚本）并发时
-    会互相 rename 掉，实测报 FileNotFoundError 导致设置写不进去。
+    Uses a unique temp name: a fixed .tmp collides when several writers (UI and
+    verification scripts) run concurrently, and we measured a FileNotFoundError
+    from the rename that made settings impossible to save.
     """
     keep = []
     try:
@@ -174,7 +197,7 @@ def write_ctl(seg, bg):
                 if not s or s.startswith("#"):
                     continue
                 k = s.split("=", 1)[0].strip()
-                # 自己要写的键由新值接管，其余原样保留
+                # Keys we write are taken over by the new value, the rest kept as-is
                 if k in ("seg", "bg"):
                     continue
                 keep.append(s)
@@ -205,9 +228,10 @@ def backend_pids():
     return out
 
 
-# ── 共享内存取帧 ───────────────────────────────────────────────────
+# ── Shared-memory frame source ──────────────────────────────────
 class Frames:
-    """映射后端发布的帧缓冲。后端重启会重建文件，需重新映射。"""
+    """Maps the frame buffer published by the backend. A backend restart
+    recreates the file, so the mapping has to be re-established."""
 
     def __init__(self):
         self.mm = None
@@ -227,7 +251,7 @@ class Frames:
             self.close()
             return False
         self.mm = mmap.mmap(self.fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
-        # 头部先读一次拿尺寸
+        # Read the header once to get the dimensions
         seq, w, h, _ = struct.unpack_from("<IIII", self.mm, 0)
         if w == 0 or h == 0 or size < HDR + w * h * 3:
             self.close()
@@ -239,16 +263,18 @@ class Frames:
         return True
 
     def _stale(self):
-        """当前 SHM 路径是否已指向另一个文件（后端重启会 rm 后重建）。
+        """Whether the SHM path now points at a different file (a backend
+        restart removes and recreates it).
 
-        后端重启时 up.sh 会 `rm -f /dev/shm/humanseg.frames` 再新建，
-        本进程仍 mmap 着**已删除的旧 inode** —— 读得到数据、seq 却永远
-        停住，表现就是画面完全冻结而进程还活着（2026-11-06 线上事故）。
+        On restart up.sh runs `rm -f /dev/shm/humanseg.frames` and creates a new
+        one, while this process still mmaps the **already-unlinked old inode**:
+        reads still succeed but seq never advances, so the picture is completely
+        frozen while the process looks alive (field incident 2026-11-06).
         """
         try:
             return os.stat(SHM).st_ino != self.ino
         except OSError:
-            return True          # 文件暂时不存在也算失效，下一帧重试
+            return True          # missing file counts as stale, retry next frame
 
     def close(self):
         if self.mm is not None:
@@ -259,49 +285,56 @@ class Frames:
             self.fd = None
 
     def latest(self):
-        """拿最新一帧。返回 True 表示有更新。
+        """Fetch the newest frame. Returns True when there is an update.
 
-        注意这里刻意不复用自建 bytearray：原来每帧 bytes(self.buf) 会额外
-        分配 3MB（1280*800*3），28fps 就是 84MB/s 的分配量，Python GC
-        压力大，点按钮时容易撞上停顿。现在只做一次切片拷贝。
+        Note that we deliberately avoid building an intermediate bytearray here:
+        the previous per-frame bytes(self.buf) allocated an extra 3 MB
+        (1280*800*3), which at 28 fps is 84 MB/s of allocation, and that GC
+        pressure showed up as stalls when clicking buttons. Now it is a single
+        slice copy.
         """
         if self.mm is None and not self.attach():
             return False
-        # 后端重启会 rm+重建 shm，本进程还挂在旧 inode 上 —— 此时必须重挂，
-        # 否则画面永久冻结（进程活着但 seq 再也不动）。
+        # A backend restart rm+recreates the shm while this process is still
+        # attached to the old inode - we must re-attach, otherwise the picture
+        # freezes forever (process alive but seq never moves again).
         if self._stale():
             self.close()
             if not self.attach():
                 return False
-        # 双检：两次序号相同才算读完整（后端一边写我们一边拷会撕裂）
+        # Double-check: only a matching seq twice means a complete read
+        # (copying while the backend writes would tear the frame)
         n = self.w * self.h * 3
         for _ in range(3):
             s0 = struct.unpack_from("<I", self.mm, 0)[0]
             if s0 == self.seq:
-                return False                     # 没有新帧
-            # mmap 没有 readinto，用切片拿到 bytes（一次拷贝）
+                return False                     # no new frame
+            # mmap has no readinto, so slice to get bytes (one copy)
             self.buf = self.mm[HDR:HDR + n]
             s1 = struct.unpack_from("<I", self.mm, 0)[0]
             if s0 == s1:
                 self.seq = s0
                 return True
-        return False                             # 一直撕裂，下次再试
+        return False                             # kept tearing, try again later
 
     def texture(self):
-        # BGR -> 内存纹理（GDK 认 B8G8R8A8，我们只喂 3 字节紧凑 BGR，
-        # 用 B8G8R8 对应的 strided 形式即可，GTK 会自己补齐）
+        # BGR -> memory texture (GDK wants B8G8R8A8; we feed packed 3-byte
+        # BGR and use the strided B8G8R8 form, GTK pads it itself)
         b = GLib.Bytes.new(self.buf)
         return Gdk.MemoryTexture.new(
             self.w, self.h, Gdk.MemoryFormat.B8G8R8, b, self.w * 3)
 
 
-# ── 右上角齿轮展开的设置面板 ───────────────────────────────────────
+# ── Settings panel opened by the top-right gear ──────────────────
 class SettingsPanel(Gtk.Box):
-    """点齿轮才出现。里面只做两件事：开/关分割、选背景。
+    """Only shown after clicking the gear. It does exactly two things: turn
+    segmentation on/off, and pick the background style.
 
-    基类是普通 Gtk.Box 而不是 Gtk.Popover：popover 在 Wayland 下是独立
-    xdg_popup 表面 + 隐式 grab，关闭时那次点击会穿透到下面，导致
-    "关了又被齿轮点开"。内嵌 Box 没有独立表面，可见性完全由我们控制。
+    The base class is a plain Gtk.Box rather than Gtk.Popover: under Wayland a
+    popover is a separate xdg_popup surface with an implicit grab, so the click
+    that dismisses it falls through to whatever is underneath, which produced
+    "it closes and the gear immediately reopens it". An embedded Box has no
+    separate surface; visibility is entirely under our control.
     """
 
     def __init__(self, on_change):
@@ -325,15 +358,32 @@ class SettingsPanel(Gtk.Box):
         self.append(Gtk.Separator())
 
         self.append(Gtk.Label(label="Virtual background", xalign=0))
-        self.dd = Gtk.DropDown.new_from_strings(BG_NAMES)
-        self.dd.connect("notify::selected", self._bg_changed)
-        self.append(self.dd)
+        # Deliberately not Gtk.DropDown: when opened under GTK4 it creates a
+        # separate xdg_popup surface, which on Wayland shows up as a detached
+        # box floating in the middle of the screen (the "square pops up in the
+        # centre" the user reported, same root cause as the gear issue noted
+        # further down). An embedded row of buttons has no separate surface and
+        # no grab, so clicking a choice simply selects it.
+        self.bgbtns = []
+        bgrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bgrow.set_homogeneous(True)
+        for i, name in enumerate(BG_NAMES):
+            # Plain Button plus our own "selected" CSS class gives the radio
+            # behaviour. Not ToggleButton: clicking the active one clears its
+            # state and needs extra debouncing. Not DropDown either: that is
+            # exactly what produced the box in the middle of the screen.
+            b = Gtk.Button(label=name)
+            b.add_css_class("humanseg-bgbtn")
+            b.connect("clicked", self._bg_clicked, i)
+            bgrow.append(b)
+            self.bgbtns.append(b)
+        self.append(bgrow)
 
         self.status = Gtk.Label(xalign=0)
         self.status.add_css_class("dim-label")
         self.append(self.status)
 
-        # 后端没起来时给个启动按钮
+        # Offer a start button while the backend is not running
         self.startbtn = Gtk.Button(label="Start backend")
         self.startbtn.connect("clicked", self._start)
         self.append(self.startbtn)
@@ -343,7 +393,14 @@ class SettingsPanel(Gtk.Box):
     def reload(self):
         seg, bg = read_ctl()
         self.sw.set_active(bool(seg))
-        self.dd.set_selected(bg)
+        # The button row is a radio group: only the current choice is lit, marked
+        # with a CSS class rather than the widget's own toggle state (a plain
+        # Button has none), so the callback does not write ctl a second time.
+        for i, b in enumerate(self.bgbtns):
+            if i == bg:
+                b.add_css_class("selected")
+            else:
+                b.remove_css_class("selected")
         alive = bool(backend_pids())
         self.startbtn.set_visible(not alive)
         self.status.set_label(
@@ -357,19 +414,21 @@ class SettingsPanel(Gtk.Box):
         self._on_change()
         return False
 
-    def _bg_changed(self, dd, _p):
+    def _bg_clicked(self, _btn, idx):
         seg, _bg = read_ctl()
-        write_ctl(seg, dd.get_selected())
+        write_ctl(seg, idx)
         self.reload()
         self._on_change()
 
     def _start(self, _b):
-        # 幂等：已经在跑就绝不再起一个。重复启动会抢摄像头，表现就是画面卡住不动。
+        # Idempotent: never start a second instance. A duplicate grabs the camera
+        # and the visible symptom is a frozen picture.
         if backend_pids():
             self.reload()
             return
-        # 用 spawn_async 而不是 subprocess：subprocess 会 fork+exec 并可能
-        # 在 fork 瞬间复制整个 3MB 级缓冲，GUI 线程上做这个会明显卡一下。
+        # spawn_async rather than subprocess: subprocess does fork+exec and may
+        # copy the whole multi-MB buffer at fork time, which visibly stalls the
+        # GUI thread.
         try:
             GLib.spawn_async(
                 argv=["/bin/sh", "-c", LAUNCH],
@@ -391,15 +450,17 @@ LAUNCH = (
 )
 
 
-# ── 主窗口：画面 + 右上角齿轮 ──────────────────────────────────────
+# ── Main window: picture plus the top-right gear ────────────────
 class View(Gtk.Window):
     def __init__(self):
         super().__init__(title="Portrait Segmentation")
-        # 在这里装样式：任何入口构造 View 都要有正确配色，
-        # 不能只在 main() 里装（否则测试脚本/其它进程看到的是白底白字）。
+        # Install the stylesheet here: any entry point constructing a View needs
+        # the correct colours, not just main() (test scripts and other processes
+        # would otherwise see white on white).
         install_css()
-        # 无边框全屏：画面铺满，不出现标题栏/关闭按钮（Wayland 由合成器定位置，
-        # 这里只负责窗口内容；要真正全屏需窗口管理器配合）。
+        # Undecorated fullscreen: the picture fills everything, no title bar or
+        # close button (Wayland lets the compositor place the window; this code
+        # only owns the content. True fullscreen needs window-manager support).
         self.set_decorated(False)
         self.fullscreen()
 
@@ -408,18 +469,20 @@ class View(Gtk.Window):
         over = Gtk.Overlay()
         self.set_child(over)
 
-        # 画面层
+        # Picture layer
         self.pic = Gtk.Picture(hexpand=True, vexpand=True,
                                content_fit=Gtk.ContentFit.CONTAIN)
         over.set_child(self.pic)
 
-        # 右上角齿轮 + 它弹的设置面板
-        # 用普通 Button + 窗口内嵌面板，**刻意不用 Gtk.MenuButton/Gtk.Popover**：
-        # Wayland 下 popover 是独立的 xdg_popup 表面并带隐式 grab，
-        # 关闭它的那次点击会穿透到下面（齿轮），于是"关了又立刻开"，
-        # 表现就是弹窗永远收不回去。补 popdown()/手势都治不了根。
-        # 内嵌成 Overlay 的一个普通子控件就没有独立表面、没有 grab，
-        # 齿轮的点击是唯一入口，点一次开、再点一次关，行为完全确定。
+        # Top-right gear plus the settings panel it opens.
+        # A plain Button with an in-window panel, **deliberately not
+        # Gtk.MenuButton/Gtk.Popover**: under Wayland a popover is a separate
+        # xdg_popup surface with an implicit grab, so the dismissing click falls
+        # through to the gear underneath and "closing it immediately reopens
+        # it" - the popup could never be dismissed. popdown() and gestures do
+        # not fix the root cause. Embedded as an ordinary Overlay child it has no
+        # separate surface and no grab, the gear click is the only entry point,
+        # so one click opens and the next closes.
         self.gear = Gtk.Button()
         self.gear.set_icon_name("emblem-system-symbolic")
         self.gear.add_css_class("circular")
@@ -435,13 +498,13 @@ class View(Gtk.Window):
         self.panel = SettingsPanel(self._on_setting_changed)
         self.panel.set_halign(Gtk.Align.END)
         self.panel.set_valign(Gtk.Align.START)
-        self.panel.set_margin_top(72)      # 让开齿轮
+        self.panel.set_margin_top(72)      # clear the gear
         self.panel.set_margin_end(16)
         self.panel.add_css_class("humanseg-panel")
         self.panel.set_visible(False)
         over.add_overlay(self.panel)
 
-        # 点画面关面板 / Esc 关面板
+        # Click the picture or press Esc to close the panel
         click = Gtk.GestureClick()
         click.connect("pressed", self._close_panel)
         self.pic.add_controller(click)
@@ -450,10 +513,11 @@ class View(Gtk.Window):
         key.connect("key-pressed", self._on_key)
         self.add_controller(key)
 
-        # 每帧检查共享内存有没有新画面；没有就保持上一帧，不刷新纹理
+        # Each tick, check the shared memory for a new picture; if there is
+        # none, keep the previous frame and do not refresh the texture
         self._n = 0
         self._t0 = 0.0
-        self._tick = GLib.timeout_add(16, self._pull)   # ~60Hz 轮询
+        self._tick = GLib.timeout_add(16, self._pull)   # ~60 Hz poll
         GLib.timeout_add(1500, self._refresh_panel)
 
     def _toggle_panel(self, *_a):
@@ -476,9 +540,15 @@ class View(Gtk.Window):
     def _pull(self):
         if self.frames.latest():
             self.pic.set_paintable(self.frames.texture())
-            # 打点：证明画面真的在更新（而不是停在白屏上）
+            # Log a heartbeat proving the picture really updates (rather than
+            # sitting on a blank screen)
             if self._n == 0:
                 self._t0 = time.time()
+                # First frame: log it immediately. Without this the earliest
+                # visible line is the 120-frame report ~4.4 s later, which makes
+                # start-up latency impossible to measure from the log.
+                print("first frame at %.2fs" % (self._t0 - _START_T),
+                      flush=True)
             self._n += 1
             if self._n % 120 == 0:
                 dt = time.time() - self._t0
@@ -488,19 +558,21 @@ class View(Gtk.Window):
         return True
 
     def _refresh_panel(self):
-        # 后端活着/死掉要能反映出来，但没必要每 1.5s 扫一遍 /proc——
-        # 只在面板打开、或状态行还显示"未运行"时检查（那时才需要发现它起来）。
+        # Backend death/liveness must be reflected, but scanning /proc every
+        # 1.5 s is unnecessary - only check while the panel is open or while the
+        # status line still says "not running" (that is when we need to notice).
         if self.panel.get_visible() or not backend_pids():
             self.panel.reload()
         return True
 
     def _on_setting_changed(self):
-        pass        # 后端自己轮询 ctl.conf，这里无需通知
+        pass        # the backend polls ctl.conf itself, nothing to notify
 
 
 def main():
-    # 不用 Gtk.Application：它会尝试在 session bus 注册唯一名，
-    # `sudo -u qq` 下实测拿不到可用 DBUS，报 NoReply 后窗口不出现。
+    # Not using Gtk.Application: it tries to register a unique name on the
+    # session bus, and under `sudo -u <user>` we measured no usable DBUS - it
+    # fails with NoReply and the window never appears.
     loop = GLib.MainLoop()
     win = View()
     win.connect("close-request", lambda *a: (loop.quit(), False)[1])

@@ -134,15 +134,19 @@ def gui_path(win, loop):
               "青色=%.2f%%" % (100 * teal_ratio(px)))
 
         # 2) 打开开关 + 选绿色背景
+        #    用真实按钮的 emit("clicked")（走已连接的 clicked 信号 -> _bg_clicked
+        #    -> write_ctl），不是直接调 _bg_clicked 也不是直接写文件。
+        #    背景选择已从 Gtk.DropDown 换成 Button 行：DropDown 展开时是
+        #    独立 xdg_popup 表面，在 Wayland 上会浮一块方框到屏幕中央。
         p.sw.set_active(True)
-        p.dd.set_selected(3)
+        p.bgbtns[3].emit("clicked")
         time.sleep(1.4)
         seg, bg = ctl()
         check("UI 开关开 + 选 Green", seg == 1 and bg == 3,
               "ctl seg=%d bg=%d" % (seg, bg))
 
         # 3) 回到青色
-        p.dd.set_selected(0)
+        p.bgbtns[0].emit("clicked")
         time.sleep(1.4)
         seg, bg = ctl()
         check("UI 选回 Teal", seg == 1 and bg == 0, "ctl seg=%d bg=%d" % (seg, bg))
