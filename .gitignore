@@ -1,0 +1,21 @@
+# 构建产物
+build/
+*.o
+*.a
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# adb/板端临时文件
+/tmp/
+core.*

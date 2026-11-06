@@ -1,0 +1,13 @@
+/* 背景样式菜单里的小色块 */
+.humanseg-swatch {
+    width: 16px;
+    height: 16px;
+    min-width: 16px;
+    min-height: 16px;
+    border-radius: 4px;
+    margin-right: 10px;
+}
+
+.humanseg-bg-row {
+    spacing: 2px;
+}
